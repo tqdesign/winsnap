@@ -1,0 +1,279 @@
+#!/usr/bin/python3
+"""winsnap - save and restore Hyprland window layouts.
+
+  winsnap save [name]      Save every open window (workspace, position, size, launch command)
+  winsnap restore [name]   Relaunch missing windows and put every window back where it was
+  winsnap list             List saved snapshots
+  winsnap show [name]      Print a snapshot's windows
+  winsnap delete <name>    Delete a snapshot
+
+Snapshots live in ~/.local/state/winsnap/<name>.json (default name: "default").
+Each window's "cmd" field is editable if the auto-detected launch command is wrong.
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "winsnap"
+HOLD = "special:winsnap"
+LAUNCH_TIMEOUT = 30
+CUT_TOLERANCE = 40  # px; larger than gaps + borders
+
+
+def hyprctl_json(what):
+    return json.loads(subprocess.run(["hyprctl", what, "-j"], capture_output=True, text=True, check=True).stdout)
+
+
+def dispatch(lua):
+    subprocess.run(["hyprctl", "dispatch", lua], capture_output=True, text=True)
+
+
+def notify(msg):
+    print(msg)
+    subprocess.run(["notify-send", "-a", "winsnap", "Windows", msg], capture_output=True)
+
+
+def snapshot_path(name):
+    return STATE_DIR / f"{name}.json"
+
+
+# ---------- save ----------
+
+def proc_cmdline(pid):
+    try:
+        args = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        return [a.decode() for a in args if a]
+    except OSError:
+        return []
+
+
+def webapp_url(cls):
+    # Chrome --app windows get classes like chrome-outlook.office.com__mail_-Default
+    middle = cls[len("chrome-"):].rsplit("-", 1)[0]
+    host, _, path = middle.partition("__")
+    return f"https://{host}/{path.replace('_', '/')}"
+
+
+def launch_cmd(c):
+    cls = c["initialClass"] or c["class"]
+    if cls.startswith("chrome-") and "__" in cls:
+        return ["omarchy-launch-webapp", webapp_url(cls)]
+    argv = proc_cmdline(c["pid"])
+    if not argv:
+        return []
+    if cls in ("google-chrome", "chromium", "brave-browser", "microsoft-edge"):
+        # The browser's main process is shared by all its windows; ask it for another one
+        argv = [a for a in argv if not a.startswith("--app=")] + ["--new-window"]
+    return argv
+
+
+def save(name):
+    mons = {m["id"]: m["name"] for m in hyprctl_json("monitors")}
+    wins = []
+    for c in hyprctl_json("clients"):
+        if not c.get("mapped") or c["workspace"]["name"].startswith("special:"):
+            continue
+        wins.append({
+            "class": c["class"],
+            "initialClass": c["initialClass"],
+            "title": c["title"],
+            "workspace": c["workspace"]["name"],
+            "monitor": mons.get(c["monitor"]),
+            "at": c["at"],
+            "size": c["size"],
+            "floating": c["floating"],
+            "fullscreen": c["fullscreen"],
+            "cmd": launch_cmd(c),
+        })
+    active = hyprctl_json("activeworkspace")["name"]
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    data = {"saved": time.strftime("%Y-%m-%d %H:%M:%S"), "active_workspace": active, "windows": wins}
+    snapshot_path(name).write_text(json.dumps(data, indent=2))
+    notify(f"Saved {len(wins)} windows to '{name}'")
+
+
+# ---------- restore ----------
+
+def match_windows(saved, live):
+    """Pair each saved window with a live window: same class + title first, then same class."""
+    free = list(live)
+    pairs = {}
+    for exact in (True, False):
+        for i, s in enumerate(saved):
+            if i in pairs:
+                continue
+            for c in free:
+                if c["class"] == s["class"] and (not exact or c["title"] == s["title"]):
+                    pairs[i] = c["address"]
+                    free.remove(c)
+                    break
+    return pairs
+
+
+def launch_missing(saved, pairs):
+    missing = [i for i in range(len(saved)) if i not in pairs]
+    if not missing:
+        return
+    known = {c["address"] for c in hyprctl_json("clients")}
+    for i in missing:
+        cmd = saved[i]["cmd"]
+        if not cmd:
+            print(f"  ! no launch command for {saved[i]['class']}, skipping")
+            continue
+        print(f"  launching {saved[i]['class']}: {' '.join(cmd)}")
+        subprocess.Popen(["setsid", "uwsm-app", "--", *cmd], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        time.sleep(0.3)
+    waiting = [i for i in missing if saved[i]["cmd"]]
+    deadline = time.time() + LAUNCH_TIMEOUT
+    while waiting and time.time() < deadline:
+        time.sleep(0.5)
+        for c in hyprctl_json("clients"):
+            if c["address"] in known or not c.get("mapped"):
+                continue
+            for i in waiting:
+                if c["class"] == saved[i]["class"] or c["initialClass"] == saved[i]["initialClass"]:
+                    pairs[i] = c["address"]
+                    known.add(c["address"])
+                    waiting.remove(i)
+                    break
+    for i in waiting:
+        print(f"  ! {saved[i]['class']} did not open a window within {LAUNCH_TIMEOUT}s")
+    if missing:
+        time.sleep(1)  # let freshly opened windows settle before moving them
+
+
+def split(items):
+    """Find a guillotine cut separating the windows. Returns (first, second, 'r'|'d') or None."""
+    for axis, d in ((0, "r"), (1, "d")):
+        for cut in sorted({w["at"][axis] for w in items}):
+            a = [w for w in items if w["at"][axis] + w["size"][axis] <= cut + CUT_TOLERANCE and w["at"][axis] < cut]
+            b = [w for w in items if w["at"][axis] >= cut - CUT_TOLERANCE]
+            if a and b and len(a) + len(b) == len(items):
+                return a, b, d
+    return None
+
+
+def first_leaf(items):
+    return min(items, key=lambda w: (w["at"][0], w["at"][1]))
+
+
+def build(items, ws, order):
+    """Insert windows so dwindle reproduces the saved tree. items[...] all fit inside the anchor's area."""
+    if len(items) == 1:
+        return
+    cut = split(items)
+    if cut is None:
+        # Not a clean dwindle tree; just add the rest next to the anchor.
+        anchor = first_leaf(items)
+        for w in sorted(items, key=lambda w: (w["at"][0], w["at"][1])):
+            if w is not anchor:
+                place(w, ws, anchor, "r", order)
+        return
+    a, b, d = cut
+    place(first_leaf(b), ws, first_leaf(a), d, order)
+    build(a, ws, order)
+    build(b, ws, order)
+
+
+def place(w, ws, anchor, direction, order):
+    dispatch(f"hl.dsp.focus({{ window = 'address:{anchor['addr']}' }})")
+    dispatch(f"hl.dsp.layout('preselect {direction}')")
+    dispatch(f"hl.dsp.window.move({{ window = 'address:{w['addr']}', workspace = '{ws}', follow = false }})")
+    order.append(w)
+
+
+def restore(name):
+    path = snapshot_path(name)
+    if not path.exists():
+        sys.exit(f"No snapshot named '{name}' (see: winsnap list)")
+    data = json.loads(path.read_text())
+    saved = data["windows"]
+    live = [c for c in hyprctl_json("clients") if c.get("mapped") and not c["workspace"]["name"].startswith("special:")]
+
+    pairs = match_windows(saved, live)
+    launch_missing(saved, pairs)
+    wins = []
+    for i, s in enumerate(saved):
+        if i in pairs:
+            wins.append({**s, "addr": pairs[i]})
+
+    # Park everything we manage on a hidden workspace so each workspace can be rebuilt from scratch.
+    # Float actions other than "toggle" aren't reliable, so only toggle windows in the wrong state.
+    floating_now = {c["address"]: c["floating"] for c in hyprctl_json("clients")}
+    for w in wins:
+        if floating_now.get(w["addr"]) != w["floating"]:
+            dispatch(f"hl.dsp.window.float({{ window = 'address:{w['addr']}', action = 'toggle' }})")
+        dispatch(f"hl.dsp.window.move({{ window = 'address:{w['addr']}', workspace = '{HOLD}', follow = false }})")
+
+    workspaces = []
+    for w in wins:
+        if w["workspace"] not in workspaces:
+            workspaces.append(w["workspace"])
+
+    for ws in workspaces:
+        tiled = [w for w in wins if w["workspace"] == ws and not w["floating"]]
+        floating = [w for w in wins if w["workspace"] == ws and w["floating"]]
+        dispatch(f"hl.dsp.focus({{ workspace = '{ws}' }})")
+        if tiled:
+            order = []
+            first = first_leaf(tiled)
+            dispatch(f"hl.dsp.window.move({{ window = 'address:{first['addr']}', workspace = '{ws}', follow = false }})")
+            order.append(first)
+            build(tiled, ws, order)
+            for _ in range(3):  # resizing one split nudges others; a few passes converge
+                for w in order:
+                    dispatch(f"hl.dsp.window.resize({{ window = 'address:{w['addr']}', x = {w['size'][0]}, y = {w['size'][1]} }})")
+        for w in floating:
+            dispatch(f"hl.dsp.window.move({{ window = 'address:{w['addr']}', workspace = '{ws}', follow = false }})")
+            dispatch(f"hl.dsp.window.resize({{ window = 'address:{w['addr']}', x = {w['size'][0]}, y = {w['size'][1]} }})")
+            dispatch(f"hl.dsp.window.move({{ window = 'address:{w['addr']}', x = {w['at'][0]}, y = {w['at'][1]} }})")
+
+    dispatch(f"hl.dsp.focus({{ workspace = '{data.get('active_workspace', workspaces[0] if workspaces else '1')}' }})")
+    notify(f"Restored {len(wins)}/{len(saved)} windows from '{name}'")
+
+
+# ---------- misc ----------
+
+def list_snapshots():
+    if not STATE_DIR.exists() or not any(STATE_DIR.glob("*.json")):
+        print("No snapshots yet (winsnap save [name])")
+        return
+    for p in sorted(STATE_DIR.glob("*.json")):
+        d = json.loads(p.read_text())
+        print(f"{p.stem:20} {d['saved']}  {len(d['windows'])} windows")
+
+
+def show(name):
+    d = json.loads(snapshot_path(name).read_text())
+    for w in d["windows"]:
+        mode = "float" if w["floating"] else "tile"
+        print(f"ws {w['workspace']:>3}  {mode:5} {w['size'][0]}x{w['size'][1]}+{w['at'][0]}+{w['at'][1]:<6} "
+              f"{w['class']:40} {w['title'][:50]}")
+
+
+def main():
+    args = sys.argv[1:]
+    cmd = args[0] if args else "help"
+    name = args[1] if len(args) > 1 else "default"
+    if cmd == "save":
+        save(name)
+    elif cmd == "restore":
+        restore(name)
+    elif cmd == "list":
+        list_snapshots()
+    elif cmd == "show":
+        show(name)
+    elif cmd == "delete" and len(args) > 1:
+        snapshot_path(name).unlink()
+        print(f"Deleted '{name}'")
+    else:
+        print(__doc__.strip())
+
+
+if __name__ == "__main__":
+    main()
