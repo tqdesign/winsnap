@@ -69,3 +69,7 @@ that's already taken.
 - Fullscreen and pinned state are recorded but not reapplied.
 - Tuned for the dwindle layout. Other layouts get windows on the right
   workspaces, but the split structure may differ.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
